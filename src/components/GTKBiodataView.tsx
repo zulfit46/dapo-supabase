@@ -324,11 +324,9 @@ export const GTKBiodataView: React.FC<GTKBiodataViewProps> = ({
     setTimeout(() => setImportNotification(null), 6000);
 
     // Sinkronisasi ke backend & Google Sheets Web App
-    if (appConfig?.webAppUrl) {
-      syncAllGTKDirectly(appConfig.webAppUrl, finalList, mode).catch((err) => {
-        console.warn('Latar belakang sync GTK Sheets gagal:', err);
-      });
-    }
+    syncAllGTKDirectly(appConfig?.webAppUrl || '', finalList, mode).catch((err) => {
+      console.warn('Latar belakang sync GTK gagal:', err);
+    });
   };
 
   // JIKA LOGIN SEBAGAI USER: Tampilkan langsung data profil lengkap (seperti modal detail, tapi bukan modal dan bukan tabel)

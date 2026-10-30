@@ -11,19 +11,52 @@ import { INITIAL_PEMBELAJARAN_LIST } from "./src/data/initialPembelajaran.js";
 import { INITIAL_GAJI_LIST } from "./src/data/initialGaji.js";
 import { Student, AttendanceRecord, AppConfig, WaliKelas, Jurusan, GTKData, RiwayatPangkat, RiwayatKGB, PembelajaranData, GajiData, normalizeStudent } from "./src/types.js";
 
-// In-memory data storage
-let studentList: Student[] = INITIAL_STUDENTS.map(normalizeStudent);
-let cachedSheetsData: Student[] | null = null;
-let attendanceList: AttendanceRecord[] = [...INITIAL_ATTENDANCE];
-let cachedWaliKelasList: WaliKelas[] = [...INITIAL_WALI_KELAS_LIST];
+// Helper fungsi cache persisten di disk (mencegah data hilang saat server reload / restart)
+function loadDiskCache<T>(fileName: string, fallback: T): T {
+  try {
+    const filePath = path.join(process.cwd(), fileName);
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && (Array.isArray(parsed) ? parsed.length > 0 : Object.keys(parsed).length > 0)) {
+        return parsed as T;
+      }
+    }
+  } catch (e) {
+    console.warn(`[Disk Cache] Gagal membaca ${fileName}:`, e);
+  }
+  return fallback;
+}
+
+function saveDiskCache(fileName: string, data: any): void {
+  try {
+    const filePath = path.join(process.cwd(), fileName);
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn(`[Disk Cache] Gagal menyimpan ${fileName}:`, e);
+  }
+}
+
+// In-memory data storage dengan pemuatan otomatis dari cache disk lokal
+const savedDiskStudents = loadDiskCache<Student[]>('data_students_cache.json', []);
+let studentList: Student[] = savedDiskStudents.length > 0 
+  ? savedDiskStudents.map(normalizeStudent)
+  : INITIAL_STUDENTS.map(normalizeStudent);
+let cachedSheetsData: Student[] | null = savedDiskStudents.length > 0 ? [...studentList] : null;
+
+let attendanceList: AttendanceRecord[] = loadDiskCache<AttendanceRecord[]>('data_attendance_cache.json', [...INITIAL_ATTENDANCE]);
+let cachedWaliKelasList: WaliKelas[] = loadDiskCache<WaliKelas[]>('data_walikelas_cache.json', [...INITIAL_WALI_KELAS_LIST]);
 let cachedWaliKelasMap: Record<string, string> = { ...INITIAL_WALI_KELAS };
-let cachedJurusanList: Jurusan[] = [...INITIAL_JURUSAN_LIST];
-let cachedGTKList: GTKData[] = [...INITIAL_GTK_LIST];
-let cachedPangkatList: RiwayatPangkat[] = [...INITIAL_RIWAYAT_PANGKAT];
-let cachedKGBList: RiwayatKGB[] = [...INITIAL_RIWAYAT_KGB];
-let cachedGajiList: GajiData[] = [...INITIAL_GAJI_LIST];
-let cachedPembelajaranList: PembelajaranData[] = [];
-let isPembelajaranLoadedFromSheets = false;
+if (cachedWaliKelasList.length > 0) {
+  cachedWaliKelasList.forEach(w => { if (w.kelas && w.nama) cachedWaliKelasMap[w.kelas] = w.nama; });
+}
+let cachedJurusanList: Jurusan[] = loadDiskCache<Jurusan[]>('data_jurusan_cache.json', [...INITIAL_JURUSAN_LIST]);
+let cachedGTKList: GTKData[] = loadDiskCache<GTKData[]>('data_gtk_cache.json', [...INITIAL_GTK_LIST]);
+let cachedPangkatList: RiwayatPangkat[] = loadDiskCache<RiwayatPangkat[]>('data_pangkat_cache.json', [...INITIAL_RIWAYAT_PANGKAT]);
+let cachedKGBList: RiwayatKGB[] = loadDiskCache<RiwayatKGB[]>('data_kgb_cache.json', [...INITIAL_RIWAYAT_KGB]);
+let cachedGajiList: GajiData[] = loadDiskCache<GajiData[]>('data_gaji_cache.json', [...INITIAL_GAJI_LIST]);
+let cachedPembelajaranList: PembelajaranData[] = loadDiskCache<PembelajaranData[]>('data_pembelajaran_cache.json', []);
+let isPembelajaranLoadedFromSheets = cachedPembelajaranList.length > 0;
 
 // Persistent Allowed Download Headers for GTK
 const HEADERS_CACHE_FILE = path.join(process.cwd(), 'gtk_download_headers.json');
@@ -274,11 +307,30 @@ async function fetchFromGoogleSheets(): Promise<Student[] | null> {
               }
 
               if (parsedStudents.length > 0) {
-                cachedSheetsData = parsedStudents;
-                studentList = parsedStudents;
+                // Jangan timpa membabi buta: lakukan smart merge agar data hasil impor Excel tidak terhapus
+                const existingSaved = loadDiskCache<Student[]>('data_students_cache.json', []);
+                const baseToMerge = existingSaved.length > 0 ? existingSaved : studentList;
+                
+                const mergedMap = new Map<string, Student>();
+                baseToMerge.forEach(s => {
+                  const key = (s.nisn || s.nipd || s.id || '').trim();
+                  if (key) mergedMap.set(key, s);
+                });
+                parsedStudents.forEach(inc => {
+                  const key = (inc.nisn || inc.nipd || inc.id || '').trim();
+                  if (key) {
+                    const ex = mergedMap.get(key);
+                    mergedMap.set(key, ex ? { ...ex, ...inc, id: ex.id } : inc);
+                  }
+                });
+
+                const finalList = Array.from(mergedMap.values()).map(normalizeStudent);
+                cachedSheetsData = finalList;
+                studentList = finalList;
+                saveDiskCache('data_students_cache.json', finalList);
                 appConfig.lastSyncedAt = new Date().toISOString();
-                console.log(`Successfully fetched ${parsedStudents.length} real students via GViz!`);
-                return parsedStudents;
+                console.log(`Successfully merged ${finalList.length} students (preserving imported data) via GViz!`);
+                return finalList;
               }
             }
           }
@@ -304,10 +356,28 @@ async function fetchFromGoogleSheets(): Promise<Student[] | null> {
           const remoteData = await response.json();
           if (remoteData && remoteData.status === "success" && Array.isArray(remoteData.data)) {
             const normalizedStudents = remoteData.data.map((s: any) => normalizeStudent(s));
-            cachedSheetsData = normalizedStudents;
-            studentList = normalizedStudents;
+            const existingSaved = loadDiskCache<Student[]>('data_students_cache.json', []);
+            const baseToMerge = existingSaved.length > 0 ? existingSaved : studentList;
+
+            const mergedMap = new Map<string, Student>();
+            baseToMerge.forEach(s => {
+              const key = (s.nisn || s.nipd || s.id || '').trim();
+              if (key) mergedMap.set(key, s);
+            });
+            normalizedStudents.forEach((inc: Student) => {
+              const key = (inc.nisn || inc.nipd || inc.id || '').trim();
+              if (key) {
+                const ex = mergedMap.get(key);
+                mergedMap.set(key, ex ? { ...ex, ...inc, id: ex.id } : inc);
+              }
+            });
+
+            const finalList = Array.from(mergedMap.values()).map(normalizeStudent);
+            cachedSheetsData = finalList;
+            studentList = finalList;
+            saveDiskCache('data_students_cache.json', finalList);
             appConfig.lastSyncedAt = new Date().toISOString();
-            console.log(`Successfully fetched ${normalizedStudents.length} students from Google Sheets Web App!`);
+            console.log(`Successfully merged ${finalList.length} students from Google Sheets Web App!`);
             return cachedSheetsData;
           }
         }
@@ -876,6 +946,7 @@ async function fetchGTKFromGoogleSheets(forceRefresh = false): Promise<GTKData[]
     if (parsedGTK.length > 0) {
       cachedGTKList = parsedGTK;
       lastGTKFetchTime = Date.now();
+      saveDiskCache('data_gtk_cache.json', cachedGTKList);
       console.log(`Total data GTK terkelola: ${parsedGTK.length} orang.`);
       return parsedGTK;
     }
@@ -1519,6 +1590,8 @@ async function startServer() {
         return g;
       });
 
+      saveDiskCache('data_gtk_cache.json', cachedGTKList);
+
       // Forward to Google Apps Script Web App
       let syncedToSheets = false;
       if (appConfig.webAppUrl && updatedItem) {
@@ -1593,6 +1666,8 @@ async function startServer() {
         }
         return g;
       });
+
+      saveDiskCache('data_gtk_cache.json', cachedGTKList);
 
       // Forward to Google Apps Script
       let syncedToSheets = false;
@@ -1694,6 +1769,7 @@ async function startServer() {
     };
 
     cachedPangkatList.push(newItem);
+    saveDiskCache('data_pangkat_cache.json', cachedPangkatList);
 
     // Forward to Google Apps Script Web App if available and not already forwarded by client
     const shouldForwardPangkat = req.query.forward !== 'false' && req.body.skipSheetsForward !== true;
@@ -1724,6 +1800,7 @@ async function startServer() {
     }
 
     cachedPangkatList[index] = { ...cachedPangkatList[index], ...req.body };
+    saveDiskCache('data_pangkat_cache.json', cachedPangkatList);
 
     const shouldForwardPangkatUpdate = req.query.forward !== 'false' && req.body.skipSheetsForward !== true;
     if (appConfig.webAppUrl && shouldForwardPangkatUpdate) {
@@ -1760,6 +1837,7 @@ async function startServer() {
     }
 
     const [deletedItem] = cachedPangkatList.splice(index, 1);
+    saveDiskCache('data_pangkat_cache.json', cachedPangkatList);
 
     // Forward deletion to Google Sheets Web App asynchronously if configured and not already forwarded by client
     const shouldForwardPangkatDelete = req.query.forward !== 'false';
@@ -1788,6 +1866,7 @@ async function startServer() {
     const items = req.body.items || cachedPangkatList;
     if (Array.isArray(items) && items.length > 0) {
       cachedPangkatList = items;
+      saveDiskCache('data_pangkat_cache.json', cachedPangkatList);
       if (appConfig.webAppUrl) {
         try {
           await fetch(appConfig.webAppUrl, {
@@ -1871,6 +1950,7 @@ async function startServer() {
     };
 
     cachedKGBList.push(newItem);
+    saveDiskCache('data_kgb_cache.json', cachedKGBList);
 
     // Forward to Google Apps Script Web App if available and not already forwarded by client
     const shouldForwardKGB = req.query.forward !== 'false' && req.body.skipSheetsForward !== true;
@@ -1901,6 +1981,7 @@ async function startServer() {
     }
 
     cachedKGBList[index] = { ...cachedKGBList[index], ...req.body };
+    saveDiskCache('data_kgb_cache.json', cachedKGBList);
 
     const shouldForwardKGBUpdate = req.query.forward !== 'false' && req.body.skipSheetsForward !== true;
     if (appConfig.webAppUrl && shouldForwardKGBUpdate) {
@@ -1937,6 +2018,7 @@ async function startServer() {
     }
 
     const [deletedItem] = cachedKGBList.splice(index, 1);
+    saveDiskCache('data_kgb_cache.json', cachedKGBList);
 
     // Forward deletion to Google Sheets Web App asynchronously if configured and not already forwarded by client
     const shouldForwardKGBDelete = req.query.forward !== 'false';
@@ -1965,6 +2047,7 @@ async function startServer() {
     const items = req.body.items || cachedKGBList;
     if (Array.isArray(items) && items.length > 0) {
       cachedKGBList = items;
+      saveDiskCache('data_kgb_cache.json', cachedKGBList);
       if (appConfig.webAppUrl) {
         try {
           await fetch(appConfig.webAppUrl, {
@@ -2080,6 +2163,8 @@ async function startServer() {
       });
     }
 
+    saveDiskCache('data_gaji_cache.json', cachedGajiList);
+
     // Forward to Google Apps Script if webAppUrl configured
     if (appConfig.webAppUrl) {
       fetch(appConfig.webAppUrl, {
@@ -2106,6 +2191,7 @@ async function startServer() {
     const target = cleanNip(idOrNip);
 
     cachedGajiList = cachedGajiList.filter(g => g.id !== idOrNip && cleanNip(g.nip) !== target);
+    saveDiskCache('data_gaji_cache.json', cachedGajiList);
 
     if (appConfig.webAppUrl) {
       fetch(appConfig.webAppUrl, {
@@ -2131,6 +2217,7 @@ async function startServer() {
     const items = req.body.items || cachedGajiList;
     if (Array.isArray(items) && items.length > 0) {
       cachedGajiList = items;
+      saveDiskCache('data_gaji_cache.json', cachedGajiList);
       if (appConfig.webAppUrl) {
         try {
           await fetch(appConfig.webAppUrl, {
@@ -2152,7 +2239,7 @@ async function startServer() {
   });
 
   // Cache & Endpoint untuk Usulan PIP
-  let cachedPIPList: any[] = [];
+  let cachedPIPList: any[] = loadDiskCache<any[]>('data_pip_cache.json', []);
   let fetchPIPPromise: Promise<any[] | null> | null = null;
 
   async function fetchPIPFromGoogleSheets(): Promise<any[] | null> {
@@ -2357,6 +2444,8 @@ async function startServer() {
       });
     }
 
+    saveDiskCache('data_pip_cache.json', cachedPIPList);
+
     // Forward ke Google Apps Script jika webAppUrl tersedia
     if (appConfig.webAppUrl) {
       try {
@@ -2429,6 +2518,8 @@ async function startServer() {
         cachedPIPList = Array.from(map.values()).map((it, idx) => ({ ...it, no: idx + 1 }));
       }
 
+      saveDiskCache('data_pip_cache.json', cachedPIPList);
+
       // Teruskan ke Google Apps Script Web App jika tersedia
       if (appConfig.webAppUrl) {
         try {
@@ -2466,6 +2557,76 @@ async function startServer() {
     }
   });
 
+  // Cache & Endpoints untuk Keterangan Desil & PIP
+  let cachedDesilList: any[] = loadDiskCache<any[]>('data_desil_cache.json', []);
+
+  // GET Desil Data
+  app.get("/api/desil", (req, res) => {
+    res.json({
+      status: "success",
+      total: cachedDesilList.length,
+      data: cachedDesilList
+    });
+  });
+
+  // POST Save Single Desil
+  app.post("/api/desil/save", (req, res) => {
+    const { nisn, desil, ket_pip } = req.body;
+    if (!nisn) {
+      return res.status(400).json({ status: "error", message: "NISN diperlukan" });
+    }
+    const cleanNisn = String(nisn).trim();
+    const idx = cachedDesilList.findIndex(d => String(d.nisn).trim() === cleanNisn);
+    const item = {
+      nisn: cleanNisn,
+      desil: desil !== undefined ? String(desil).trim() : '',
+      ket_pip: ket_pip !== undefined ? String(ket_pip).trim() : ''
+    };
+    if (idx >= 0) {
+      cachedDesilList[idx] = { ...cachedDesilList[idx], ...item };
+    } else {
+      cachedDesilList.push(item);
+    }
+    saveDiskCache('data_desil_cache.json', cachedDesilList);
+    res.json({ status: "success", message: "Data desil berhasil disimpan", data: item });
+  });
+
+  // POST Import Desil
+  app.post("/api/desil/import", (req, res) => {
+    const { items, mode } = req.body;
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ status: "error", message: "Data items tidak valid" });
+    }
+    const cleanItems = items.map((it: any) => ({
+      nisn: String(it.nisn || '').trim(),
+      desil: String(it.desil || '').trim(),
+      ket_pip: String(it.ket_pip || it.ketPip || '').trim()
+    })).filter(it => it.nisn);
+
+    if (mode === 'replace') {
+      cachedDesilList = cleanItems;
+    } else {
+      const map = new Map<string, any>();
+      cachedDesilList.forEach(d => {
+        if (d.nisn) map.set(d.nisn, d);
+      });
+      cleanItems.forEach(it => {
+        if (it.nisn) {
+          const prev = map.get(it.nisn);
+          map.set(it.nisn, prev ? { ...prev, ...it } : it);
+        }
+      });
+      cachedDesilList = Array.from(map.values());
+    }
+    saveDiskCache('data_desil_cache.json', cachedDesilList);
+    res.json({
+      status: "success",
+      message: `Berhasil mengimpor ${cleanItems.length} data desil`,
+      total: cachedDesilList.length,
+      data: cachedDesilList
+    });
+  });
+
   // POST Import GTK (Smart Merge / Replace)
   app.post("/api/gtk/import", async (req, res) => {
     try {
@@ -2499,6 +2660,8 @@ async function startServer() {
         });
         cachedGTKList = Array.from(map.values()).map((it, idx) => ({ ...it, no: idx + 1 }));
       }
+
+      saveDiskCache('data_gtk_cache.json', cachedGTKList);
 
       if (appConfig.webAppUrl) {
         try {
@@ -2640,6 +2803,8 @@ async function startServer() {
         });
       }
 
+      saveDiskCache('data_gtk_cache.json', cachedGTKList);
+
       if (appConfig.webAppUrl) {
         try {
           const payload = {
@@ -2679,6 +2844,26 @@ async function startServer() {
         return res.status(400).json({ status: "error", message: "Data pangkat tidak boleh kosong" });
       }
 
+      if (mode === 'replace') {
+        cachedPangkatList = items;
+      } else {
+        const map = new Map<string, RiwayatPangkat>();
+        cachedPangkatList.forEach(p => {
+          const k = `${p.nip || ''}_${p.noSk || ''}_${p.tmt || ''}`.toLowerCase();
+          map.set(k, p);
+        });
+        items.forEach((p: any) => {
+          const k = `${p.nip || ''}_${p.noSk || p.no_sk || ''}_${p.tmt || ''}`.toLowerCase();
+          if (map.has(k)) {
+            map.set(k, { ...map.get(k), ...p });
+          } else {
+            map.set(k, p);
+          }
+        });
+        cachedPangkatList = Array.from(map.values());
+      }
+      saveDiskCache('data_pangkat_cache.json', cachedPangkatList);
+
       if (appConfig.webAppUrl) {
         try {
           const payload = {
@@ -2695,7 +2880,8 @@ async function startServer() {
 
       return res.json({
         status: "success",
-        message: `Berhasil mengimpor dan menyinkronkan ${items.length} riwayat kepangkatan!`
+        message: `Berhasil mengimpor dan menyinkronkan ${items.length} riwayat kepangkatan!`,
+        total: cachedPangkatList.length
       });
     } catch (err: any) {
       console.error("[Pangkat Import] Error:", err);
@@ -2714,6 +2900,26 @@ async function startServer() {
         return res.status(400).json({ status: "error", message: "Data KGB tidak boleh kosong" });
       }
 
+      if (mode === 'replace') {
+        cachedKGBList = items;
+      } else {
+        const map = new Map<string, RiwayatKGB>();
+        cachedKGBList.forEach(k => {
+          const key = `${k.nip || ''}_${k.noSk || ''}_${k.tmt || ''}`.toLowerCase();
+          map.set(key, k);
+        });
+        items.forEach((k: any) => {
+          const key = `${k.nip || ''}_${k.noSk || k.no_sk || ''}_${k.tmt || k.TMT_kgb || ''}`.toLowerCase();
+          if (map.has(key)) {
+            map.set(key, { ...map.get(key), ...k });
+          } else {
+            map.set(key, k);
+          }
+        });
+        cachedKGBList = Array.from(map.values());
+      }
+      saveDiskCache('data_kgb_cache.json', cachedKGBList);
+
       if (appConfig.webAppUrl) {
         try {
           const payload = {
@@ -2730,7 +2936,8 @@ async function startServer() {
 
       return res.json({
         status: "success",
-        message: `Berhasil mengimpor dan menyinkronkan ${items.length} riwayat KGB!`
+        message: `Berhasil mengimpor dan menyinkronkan ${items.length} riwayat KGB!`,
+        total: cachedKGBList.length
       });
     } catch (err: any) {
       console.error("[KGB Import] Error:", err);
@@ -2749,6 +2956,26 @@ async function startServer() {
         return res.status(400).json({ status: "error", message: "Data gaji tidak boleh kosong" });
       }
 
+      if (mode === 'replace') {
+        cachedGajiList = items;
+      } else {
+        const map = new Map<string, GajiData>();
+        cachedGajiList.forEach(g => {
+          const key = `${g.nip || ''}_${g.bulan || ''}`.toLowerCase();
+          map.set(key, g);
+        });
+        items.forEach((g: any) => {
+          const key = `${g.nip || ''}_${g.bulan || ''}`.toLowerCase();
+          if (map.has(key)) {
+            map.set(key, { ...map.get(key), ...g });
+          } else {
+            map.set(key, g);
+          }
+        });
+        cachedGajiList = Array.from(map.values());
+      }
+      saveDiskCache('data_gaji_cache.json', cachedGajiList);
+
       if (appConfig.webAppUrl) {
         try {
           const payload = {
@@ -2766,7 +2993,8 @@ async function startServer() {
 
       return res.json({
         status: "success",
-        message: `Berhasil mengimpor dan menyinkronkan ${items.length} data gaji GTK!`
+        message: `Berhasil mengimpor dan menyinkronkan ${items.length} data gaji GTK!`,
+        total: cachedGajiList.length
       });
     } catch (err: any) {
       console.error("[Gaji Import] Error:", err);
@@ -2810,6 +3038,8 @@ async function startServer() {
         });
         cachedPembelajaranList = Array.from(map.values()).map((it, idx) => ({ ...it, no: idx + 1 }));
       }
+
+      saveDiskCache('data_pembelajaran_cache.json', cachedPembelajaranList);
 
       if (appConfig.webAppUrl) {
         try {
@@ -2878,6 +3108,8 @@ async function startServer() {
         programKeahlian: String(j.programKeahlian || j.Program_Keahlian || j.program_keahlian || j.ProgramKeahlian || "").trim(),
         konsentrasiKeahlian: String(j.konsentrasiKeahlian || j.Konsentrasi_Keahlian || j.konsentrasi_keahlian || j.KonsentrasiKeahlian || "").trim()
       }));
+
+      saveDiskCache('data_jurusan_cache.json', cachedJurusanList);
 
       if (appConfig.webAppUrl) {
         try {
@@ -2961,6 +3193,7 @@ async function startServer() {
         }
       });
       cachedWaliKelasMap = newMap;
+      saveDiskCache('data_walikelas_cache.json', cachedWaliKelasList);
 
       // Jika ada webAppUrl, teruskan ke Google Apps Script
       if (appConfig.webAppUrl) {
@@ -3787,6 +4020,7 @@ async function startServer() {
 
     const newStudent = normalizeStudent(rawStudent);
     studentList.unshift(newStudent);
+    saveDiskCache('data_students_cache.json', studentList);
 
     // If Web App URL is configured, forward create action
     if (appConfig.webAppUrl) {
@@ -3849,6 +4083,9 @@ async function startServer() {
       studentList = [...importedStudents];
       cachedSheetsData = [...importedStudents];
     }
+
+    // Simpan persisten ke disk agar tidak hilang saat server restart / browser refresh
+    saveDiskCache('data_students_cache.json', studentList);
 
     appConfig.lastSyncedAt = new Date().toISOString();
 
@@ -3957,6 +4194,8 @@ async function startServer() {
       });
     }
 
+    saveDiskCache('data_students_cache.json', studentList);
+
     // Sync to Google Apps Script Web App (Synchronous with 25s timeout for confirmed persistence)
     let gasResult: any = null;
     let gasError: string | null = null;
@@ -4027,6 +4266,8 @@ async function startServer() {
       }
     }
 
+    saveDiskCache('data_students_cache.json', studentList);
+
     res.json({ status: "success", message: "Data siswa berhasil diperbarui", data: studentList[index] });
 
     if (appConfig.webAppUrl) {
@@ -4049,6 +4290,7 @@ async function startServer() {
     }
 
     const removedStudent = studentList.splice(index, 1)[0];
+    saveDiskCache('data_students_cache.json', studentList);
 
     if (appConfig.webAppUrl) {
       try {
@@ -4088,6 +4330,7 @@ async function startServer() {
           });
         }
       });
+      saveDiskCache('data_attendance_cache.json', attendanceList);
     }
     res.json({ status: "success", message: "Presensi berhasil diperbarui", data: attendanceList });
   });

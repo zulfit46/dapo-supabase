@@ -162,11 +162,9 @@ export const GTKPangkatView: React.FC<GTKPangkatViewProps> = ({
       timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
     });
 
-    if (appConfig.webAppUrl) {
-      syncAllPangkatDirectly(appConfig.webAppUrl, finalList, mode).catch((err) => {
-        console.warn('Sync pangkat background error:', err);
-      });
-    }
+    syncAllPangkatDirectly(appConfig?.webAppUrl || '', finalList, mode).catch((err) => {
+      console.warn('Sync pangkat background error:', err);
+    });
   };
 
   // Save to safe storage

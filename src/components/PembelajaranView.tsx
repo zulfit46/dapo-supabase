@@ -526,12 +526,10 @@ export const PembelajaranView: React.FC<PembelajaranViewProps> = ({
         ? `Smart Impor berhasil! ${stats.matchingCount} data diperbarui, ${stats.newCount} data baru ditambahkan.`
         : `Impor Ganti Semua berhasil! Total ${finalList.length} data pembelajaran tersimpan.`
     );
-    if (appConfig?.webAppUrl) {
-      try {
-        await syncAllPembelajaranDirectly(appConfig.webAppUrl, finalList, mode);
-      } catch (err) {
-        console.warn('Sync pembelajaran ke Google Sheets:', err);
-      }
+    try {
+      await syncAllPembelajaranDirectly(appConfig?.webAppUrl || '', finalList, mode);
+    } catch (err) {
+      console.warn('Sync pembelajaran error:', err);
     }
   };
 

@@ -1,4 +1,4 @@
-import { Student, AppConfig, GTKData, RiwayatPangkat, RiwayatKGB, MutasiMasukItem, MutasiKeluarItem, PembelajaranData, GajiData, PIPData, WaliKelas, Jurusan, normalizeStudent } from '../types';
+import { Student, AppConfig, GTKData, RiwayatPangkat, RiwayatKGB, MutasiMasukItem, MutasiKeluarItem, PembelajaranData, GajiData, PIPData, WaliKelas, Jurusan, DesilData, normalizeStudent } from '../types';
 import { SPREADSHEET_ID, SHEET_NAME, SHEET_NAME_GTK, SHEET_NAME_NAIKPANGKAT, SHEET_NAME_KGB, SHEET_NAME_MUTASI_MASUK, SHEET_NAME_MUTASI_KELUAR, SHEET_NAME_PEMBELAJARAN, SHEET_NAME_GAJI, SHEET_NAME_WALIKELAS, SHEET_NAME_JURUSAN, DRIVE_FOLDER_ID_MUTASI_KELUAR } from '../data/codeGsScript';
 import { INITIAL_PEMBELAJARAN_LIST } from '../data/initialPembelajaran';
 import { INITIAL_GAJI_LIST } from '../data/initialGaji';
@@ -2707,6 +2707,199 @@ export async function syncAllPIPDirectly(
   }
 }
 
+export const LOCAL_STORAGE_DESIL_KEY = 'dapodik_cached_desil';
+
+/**
+ * Mengambil data Keterangan Desil & PIP dari sheet "desil" Google Sheets atau Express API
+ */
+export async function fetchDesilDirectly(
+  webAppUrl?: string,
+  spreadsheetId?: string,
+  force = false
+): Promise<DesilData[]> {
+  const ssId = spreadsheetId || SPREADSHEET_ID;
+  const sheetName = 'desil';
+
+  // 1. Coba GViz Google Sheets API jika spreadsheetId ada
+  if (ssId) {
+    try {
+      const gvizUrl = `https://docs.google.com/spreadsheets/d/${ssId}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}&_t=${Date.now()}`;
+      const res = await fetch(gvizUrl, { signal: AbortSignal.timeout(12000) });
+      if (res.ok) {
+        const text = await res.text();
+        const jsonText = text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1);
+        if (jsonText) {
+          const parsed = JSON.parse(jsonText);
+          const rawRows = parsed.table?.rows || [];
+          if (rawRows.length > 0) {
+            let headerRowIndex = 0;
+            let nisnCol = 0;
+            let desilCol = 1;
+            let ketPipCol = 2;
+
+            const firstRowCells = rawRows[0]?.c?.map((c: any) => c && c.v !== null ? String(c.v).trim().toLowerCase() : '') || [];
+            const hasHeader = firstRowCells.some((c: string) => c.includes('nisn') || c.includes('desil') || c.includes('pip'));
+            if (hasHeader) {
+              firstRowCells.forEach((c: string, idx: number) => {
+                if (c.includes('nisn')) nisnCol = idx;
+                if (c.includes('desil')) desilCol = idx;
+                if (c.includes('pip')) ketPipCol = idx;
+              });
+              headerRowIndex = 1;
+            }
+
+            const list: DesilData[] = [];
+            for (let i = headerRowIndex; i < rawRows.length; i++) {
+              const row = rawRows[i]?.c;
+              if (!row) continue;
+              const nisn = row[nisnCol]?.v !== null && row[nisnCol]?.v !== undefined ? String(row[nisnCol].v).trim() : '';
+              const desil = row[desilCol]?.v !== null && row[desilCol]?.v !== undefined ? String(row[desilCol].v).trim() : '';
+              const ketPip = ketPipCol >= 0 && row[ketPipCol]?.v !== null && row[ketPipCol]?.v !== undefined ? String(row[ketPipCol].v).trim() : '';
+              if (nisn) {
+                list.push({
+                  rowIndex: i + 1,
+                  nisn,
+                  desil,
+                  ket_pip: ketPip,
+                  ketPip
+                });
+              }
+            }
+
+            if (list.length > 0) {
+              safeSetItem(LOCAL_STORAGE_DESIL_KEY, list);
+              return list;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // lanjut fallback
+    }
+  }
+
+  // 2. Coba Express server endpoint /api/desil
+  try {
+    const sRes = await fetch(`/api/desil${force ? '?force=true' : ''}`, { signal: AbortSignal.timeout(6000) });
+    if (sRes.ok) {
+      const sJson = await sRes.json().catch(() => null);
+      if (sJson && sJson.status === 'success' && Array.isArray(sJson.data) && sJson.data.length > 0) {
+        safeSetItem(LOCAL_STORAGE_DESIL_KEY, sJson.data);
+        return sJson.data;
+      }
+    }
+  } catch (e) {}
+
+  // 3. Fallback ke local storage
+  const cached = safeGetItem<DesilData[]>(LOCAL_STORAGE_DESIL_KEY, []);
+  return cached;
+}
+
+/**
+ * Menyimpan satu data Desil & PIP ke server dan Google Sheets
+ */
+export async function saveDesilDirectly(
+  webAppUrl: string | undefined,
+  nisn: string,
+  data: { desil?: string; ket_pip?: string }
+): Promise<{ success: boolean; message?: string }> {
+  const payload = {
+    nisn: String(nisn).trim(),
+    desil: data.desil !== undefined ? String(data.desil).trim() : '',
+    ket_pip: data.ket_pip !== undefined ? String(data.ket_pip).trim() : ''
+  };
+
+  // Update local storage
+  const current = safeGetItem<DesilData[]>(LOCAL_STORAGE_DESIL_KEY, []);
+  const idx = current.findIndex(d => String(d.nisn).trim() === payload.nisn);
+  if (idx >= 0) {
+    current[idx] = { ...current[idx], ...payload, ketPip: payload.ket_pip };
+  } else {
+    current.push({ ...payload, ketPip: payload.ket_pip });
+  }
+  safeSetItem(LOCAL_STORAGE_DESIL_KEY, current);
+
+  // 1. Simpan ke Express server
+  try {
+    await fetch('/api/desil/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch (err) {}
+
+  // 2. Kirim ke Google Apps Script Web App
+  if (webAppUrl) {
+    try {
+      fetch(webAppUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'saveDesil',
+          target: 'desil',
+          ...payload
+        }),
+        mode: 'no-cors',
+        signal: AbortSignal.timeout(10000)
+      }).catch(() => {});
+    } catch (e) {}
+  }
+
+  return { success: true, message: 'Data desil berhasil disimpan' };
+}
+
+/**
+ * Sinkronisasi seluruh data Desil & PIP ke server dan Google Sheets
+ */
+export async function syncAllDesilDirectly(
+  webAppUrl: string | undefined,
+  items: DesilData[],
+  mode: 'merge' | 'replace' = 'merge'
+): Promise<{ success: boolean; message: string }> {
+  safeSetItem(LOCAL_STORAGE_DESIL_KEY, items);
+
+  // 1. Kirim ke Express server
+  try {
+    const sRes = await fetch('/api/desil/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items, mode }),
+      signal: AbortSignal.timeout(30000)
+    });
+    if (sRes.ok) {
+      const sJson = await sRes.json().catch(() => null);
+      if (sJson?.status === 'success') {
+        return { success: true, message: sJson.message || `Berhasil menyimpan ${items.length} data desil!` };
+      }
+    }
+  } catch (err) {}
+
+  // 2. Kirim ke Google Apps Script Web App
+  if (webAppUrl) {
+    try {
+      const payload = {
+        action: 'syncAllDesil',
+        target: 'desil',
+        items: items.map(d => ({
+          nisn: String(d.nisn || '').trim(),
+          desil: String(d.desil || '').trim(),
+          ket_pip: String(d.ket_pip || d.ketPip || '').trim()
+        })),
+        mode
+      };
+      await fetch(webAppUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(35000)
+      });
+      return { success: true, message: `Berhasil menyinkronkan ${items.length} data desil ke Google Sheets!` };
+    } catch (e) {}
+  }
+
+  return { success: true, message: `Data ${items.length} desil berhasil disimpan di penyimpanan!` };
+}
 
 /**
  * Mengambil data Wali Kelas dari sheet "walikelas" (headers: kelas, nama, nip)

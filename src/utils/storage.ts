@@ -1,19 +1,89 @@
-// Safe LocalStorage and In-Memory Fallback Cache Manager
+// Safe LocalStorage, IndexedDB, and In-Memory Fallback Cache Manager
 // Prevents QuotaExceededError crashes when storing large student, GTK, Pangkat, or KGB datasets
 
 const memoryStore = new Map<string, string>();
 
-// Non-critical keys that can be purged if localStorage is full
+// Only truly disposable keys can be purged if localStorage quota is tight
 const PURGEABLE_KEYS = [
   'dapodik_cached_attendance',
-  'dapodik_cached_students',
-  'dapodik_cached_gtk',
-  'smkn1_riwayat_kgb_data',
-  'smkn1_riwayat_pangkat_data'
+  'dapodik_cached_mutasi_masuk'
 ];
 
 /**
- * Attempts to free up localStorage space by removing or trimming non-critical cached data
+ * IndexedDB helper for robust large-dataset persistence (up to hundreds of MBs)
+ */
+const DB_NAME = 'DapodikAppDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'app_keyval';
+
+let idbPromise: Promise<IDBDatabase> | null = null;
+
+function getIDB(): Promise<IDBDatabase> {
+  if (idbPromise) return idbPromise;
+  idbPromise = new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.indexedDB) {
+      return reject(new Error('IndexedDB not supported'));
+    }
+    const req = window.indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return idbPromise;
+}
+
+export async function idbSet<T = any>(key: string, val: T): Promise<void> {
+  try {
+    const db = await getIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.put(val, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    // silently fail
+  }
+}
+
+export async function idbGet<T = any>(key: string): Promise<T | null> {
+  try {
+    const db = await getIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(key);
+      req.onsuccess = () => resolve(req.result !== undefined ? req.result : null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Compact student object to essential fields when storing in localStorage
+ */
+function compactObject(item: any): any {
+  if (!item || typeof item !== 'object') return item;
+  const res: Record<string, any> = {};
+  for (const k of Object.keys(item)) {
+    const v = item[k];
+    if (v !== '' && v !== null && v !== undefined) {
+      res[k] = v;
+    }
+  }
+  return res;
+}
+
+/**
+ * Attempts to free up localStorage space by removing disposable temporary items
  */
 function freeStorageSpace(excludeKey?: string) {
   try {
@@ -21,7 +91,6 @@ function freeStorageSpace(excludeKey?: string) {
       if (key !== excludeKey && typeof window !== 'undefined' && window.localStorage) {
         const val = window.localStorage.getItem(key);
         if (val) {
-          // Backup to memoryStore first so in-session data is preserved
           memoryStore.set(key, val);
           window.localStorage.removeItem(key);
           break;
@@ -34,7 +103,7 @@ function freeStorageSpace(excludeKey?: string) {
 }
 
 /**
- * Safely saves data to localStorage with automatic QuotaExceededError recovery and in-memory fallback
+ * Safely saves data to localStorage and IndexedDB with automatic QuotaExceededError recovery
  */
 export function safeSetItem<T = any>(key: string, value: T): boolean {
   if (typeof window === 'undefined') return false;
@@ -47,14 +116,17 @@ export function safeSetItem<T = any>(key: string, value: T): boolean {
     return false;
   }
 
-  // Always keep in memory store as fallback
+  // 1. Keep in memory store for instant fast retrieval in session
   memoryStore.set(key, serialized);
 
+  // 2. Persist to IndexedDB asynchronously (no 5MB quota limit, survives reload)
+  idbSet(key, value).catch(() => {});
+
+  // 3. Persist to localStorage
   try {
     window.localStorage.setItem(key, serialized);
     return true;
   } catch (err: any) {
-    // Check if error is QuotaExceededError
     const isQuotaError =
       err?.name === 'QuotaExceededError' ||
       err?.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
@@ -63,16 +135,22 @@ export function safeSetItem<T = any>(key: string, value: T): boolean {
       (typeof err?.message === 'string' && err.message.toLowerCase().includes('quota'));
 
     if (isQuotaError) {
-      // Try to free up space from older caches and retry once
       freeStorageSpace(key);
-      try {
-        window.localStorage.setItem(key, serialized);
-        return true;
-      } catch (retryErr) {
-        // Still failed, we safely hold in memoryStore without throwing
-        console.warn(`[Storage] Storage quota reached. Storing "${key}" in active memory session.`);
-        return false;
+
+      // Try compacting if array of objects (remove empty strings)
+      if (Array.isArray(value)) {
+        try {
+          const compacted = value.map(compactObject);
+          const compactStr = JSON.stringify(compacted);
+          window.localStorage.setItem(key, compactStr);
+          return true;
+        } catch (compactErr) {
+          // If still quota exceeded, keep essential metadata flag
+          console.warn(`[Storage] LocalStorage quota reached for "${key}". Saved to IndexedDB & memory.`);
+          return false;
+        }
       }
+      return false;
     } else {
       console.warn(`[Storage] Unable to save key "${key}" to localStorage:`, err);
       return false;
@@ -88,17 +166,17 @@ export function safeGetItem<T = any>(key: string, fallbackValue: T): T {
 
   try {
     const item = window.localStorage.getItem(key);
-    if (item !== null && item !== undefined) {
-      // Keep memory store synced
+    if (item !== null && item !== undefined && item !== '') {
       memoryStore.set(key, item);
       try {
-        return JSON.parse(item) as T;
+        const parsed = JSON.parse(item);
+        if (parsed !== null && parsed !== undefined) return parsed as T;
       } catch {
         return item as unknown as T;
       }
     }
   } catch (e) {
-    // Fall back to memoryStore if localStorage.getItem is blocked
+    // Fall back
   }
 
   // Check memoryStore

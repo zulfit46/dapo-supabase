@@ -109,11 +109,9 @@ export const GTKGajiView: React.FC<GTKGajiViewProps> = ({
     });
     setTimeout(() => setNotification(null), 6000);
 
-    if (appConfig?.webAppUrl) {
-      syncAllGajiDirectly(appConfig.webAppUrl, finalList, mode).catch((err) => {
-        console.warn('Latar belakang sync Gaji Sheets gagal:', err);
-      });
-    }
+    syncAllGajiDirectly(appConfig?.webAppUrl || '', finalList, mode).catch((err) => {
+      console.warn('Latar belakang sync Gaji Sheets gagal:', err);
+    });
   };
 
   // Search & Filter state

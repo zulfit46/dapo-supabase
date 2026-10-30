@@ -50,6 +50,7 @@ import { SupabaseModal } from './components/SupabaseModal';
 import {
   fetchStudentsFromSupabase,
   saveStudentToSupabase,
+  batchUpsertStudentsSupabase,
   batchUpdateStudentsSupabase,
   subscribeStudentsRealtime,
   fetchGTKFromSupabase,
@@ -236,15 +237,45 @@ export default function App() {
   useEffect(() => {
     const unsubStudents = subscribeStudentsRealtime((fresh) => {
       if (fresh && fresh.length > 0) {
-        setStudents(fresh);
-        safeSetItem('dapodik_cached_students', fresh);
+        setStudents((prev) => {
+          const map = new Map<string, Student>();
+          fresh.forEach((f) => {
+            const k = (f.nisn || f.nipd || f.id || '').trim();
+            if (k) map.set(k, f);
+          });
+          prev.forEach((p) => {
+            const k = (p.nisn || p.nipd || p.id || '').trim();
+            if (k) {
+              const rem = map.get(k);
+              map.set(k, rem ? { ...rem, ...p, id: p.id || rem.id } : p);
+            }
+          });
+          const merged = Array.from(map.values()).map(normalizeStudent);
+          safeSetItem('dapodik_cached_students', merged);
+          return merged;
+        });
       }
     });
 
     const unsubGTK = subscribeGTKRealtime((fresh) => {
       if (fresh && fresh.length > 0) {
-        setGtkList(fresh);
-        safeSetItem('dapodik_cached_gtk', fresh);
+        setGtkList((prev) => {
+          const map = new Map<string, GTKData>();
+          fresh.forEach((f) => {
+            const k = String(f.nip || f.nuptk || f.id || f.nama || '').trim().toLowerCase();
+            if (k) map.set(k, f);
+          });
+          prev.forEach((p) => {
+            const k = String(p.nip || p.nuptk || p.id || p.nama || '').trim().toLowerCase();
+            if (k) {
+              const rem = map.get(k);
+              map.set(k, rem ? { ...rem, ...p, id: p.id || rem.id } : p);
+            }
+          });
+          const merged = Array.from(map.values());
+          safeSetItem('dapodik_cached_gtk', merged);
+          return merged;
+        });
       }
     });
 
@@ -319,44 +350,69 @@ export default function App() {
         }
       } catch {}
 
-      // 2. PRIMARY: Coba ambil data siswa langsung dari Supabase
-      let loadedFromSupabase = false;
-      try {
-        const sbStudents = await fetchStudentsFromSupabase();
-        if (sbStudents && sbStudents.length > 0) {
-          setStudents(sbStudents);
-          loadedFromSupabase = true;
-          safeSetItem('dapodik_cached_students', sbStudents);
-          console.log(`[Supabase] Sukses memuat ${sbStudents.length} siswa langsung dari Supabase Real-Time.`);
-        }
-      } catch (sbErr) {
-        console.log('[Supabase] Menunggu inisialisasi tabel / data di Supabase...');
-      }
+      // Helper untuk menggabungkan data remote dengan cache lokal (agar siswa hasil impor tidak hilang)
+      const smartMergeWithLocal = (incoming: Student[]): Student[] => {
+        const local = safeGetItem<Student[]>('dapodik_cached_students', []);
+        if (!local || local.length === 0) return incoming.map(normalizeStudent);
+        if (!incoming || incoming.length === 0) return local.map(normalizeStudent);
 
-      // Fallback ke Express server atau Google Sheets jika data di Supabase belum dimigrasikan
-      if (!loadedFromSupabase) {
-        let loadedFromExpress = false;
-        try {
-          const studentRes = await fetch(`/api/students${force ? '?force=true' : ''}`);
-          if (studentRes.ok) {
-            const result = await studentRes.json();
-            if (result && result.status === 'success' && Array.isArray(result.data) && result.data.length > 0) {
-              const normalized = result.data.map(normalizeStudent);
-              setStudents(normalized);
-              loadedFromExpress = true;
-              safeSetItem('dapodik_cached_students', normalized);
+        const map = new Map<string, Student>();
+        // 1. Masukkan data remote terlebih dahulu sebagai base
+        incoming.forEach(inc => {
+          const key = (inc.nisn || inc.nipd || inc.id || '').trim();
+          if (key) map.set(key, inc);
+        });
+        // 2. Terapkan data lokal (hasil impor & edit pengguna) agar tidak terhapus atau tertimpa
+        local.forEach(loc => {
+          const key = (loc.nisn || loc.nipd || loc.id || '').trim();
+          if (key) {
+            const remoteItem = map.get(key);
+            if (remoteItem) {
+              map.set(key, { ...remoteItem, ...loc, id: loc.id || remoteItem.id });
+            } else {
+              map.set(key, loc);
             }
           }
-        } catch (err) {
-          console.warn('Express server unavailable, falling back to client-side Google Sheets fetch:', err);
-        }
+        });
+        return Array.from(map.values()).map(normalizeStudent);
+      };
 
-        if (!loadedFromExpress) {
+      // 1. Ambil data siswa dari Express Server (/api/students) yang membaca disk cache persisten (data_students_cache.json)
+      let loadedFromExpress = false;
+      try {
+        const studentRes = await fetch(`/api/students${force ? '?force=true' : ''}`);
+        if (studentRes.ok) {
+          const result = await studentRes.json();
+          if (result && result.status === 'success' && Array.isArray(result.data) && result.data.length > 0) {
+            const normalized = result.data.map(normalizeStudent);
+            const merged = smartMergeWithLocal(normalized);
+            setStudents(merged);
+            loadedFromExpress = true;
+            safeSetItem('dapodik_cached_students', merged);
+          }
+        }
+      } catch (err) {
+        console.warn('Express server unavailable, falling back to Supabase/Sheets:', err);
+      }
+
+      // 2. Jika Express belum termuat, ambil data siswa dari Supabase
+      if (!loadedFromExpress) {
+        try {
+          const sbStudents = await fetchStudentsFromSupabase();
+          if (sbStudents && sbStudents.length > 0) {
+            const merged = smartMergeWithLocal(sbStudents);
+            setStudents(merged);
+            safeSetItem('dapodik_cached_students', merged);
+            console.log(`[Supabase] Sukses memuat ${merged.length} siswa.`);
+          }
+        } catch (sbErr) {
+          // Fallback ke Google Sheets GViz
           const directData = await fetchStudentsDirectly(appConfig);
           if (directData && directData.length > 0) {
             const normalized = directData.map(normalizeStudent);
-            setStudents(normalized);
-            safeSetItem('dapodik_cached_students', normalized);
+            const merged = smartMergeWithLocal(normalized);
+            setStudents(merged);
+            safeSetItem('dapodik_cached_students', merged);
             setAppConfig(prev => ({ ...prev, lastSyncedAt: new Date().toISOString() }));
           }
         }
@@ -403,16 +459,43 @@ export default function App() {
 
       // 6. Get GTK
       try {
+        const smartMergeGTKWithLocal = (incoming: GTKData[]): GTKData[] => {
+          const local = safeGetItem<GTKData[]>('dapodik_cached_gtk', []);
+          if (!local || local.length === 0) return incoming;
+          if (!incoming || incoming.length === 0) return local;
+
+          const map = new Map<string, GTKData>();
+          // 1. Simpan data incoming (remote) terlebih dahulu sebagai base
+          incoming.forEach(inc => {
+            const key = String(inc.nip || inc.nuptk || inc.id || inc.nama || '').trim().toLowerCase();
+            if (key) map.set(key, inc);
+          });
+          // 2. Terapkan data lokal (hasil impor & edit pengguna) agar tidak terhapus atau tertimpa
+          local.forEach(loc => {
+            const key = String(loc.nip || loc.nuptk || loc.id || loc.nama || '').trim().toLowerCase();
+            if (key) {
+              const remoteItem = map.get(key);
+              if (remoteItem) {
+                map.set(key, { ...remoteItem, ...loc, id: loc.id || remoteItem.id });
+              } else {
+                map.set(key, loc);
+              }
+            }
+          });
+          return Array.from(map.values());
+        };
+
         let loadedGTKFromSupabase = false;
         let freshGTKList: GTKData[] = [];
         try {
           const sbGTK = await fetchGTKFromSupabase();
           if (sbGTK && sbGTK.length > 0) {
-            setGtkList(sbGTK);
-            freshGTKList = sbGTK;
+            const merged = smartMergeGTKWithLocal(sbGTK);
+            setGtkList(merged);
+            freshGTKList = merged;
             loadedGTKFromSupabase = true;
-            safeSetItem('dapodik_cached_gtk', sbGTK);
-            console.log(`[Supabase] Sukses memuat ${sbGTK.length} GTK langsung dari Supabase Real-Time.`);
+            safeSetItem('dapodik_cached_gtk', merged);
+            console.log(`[Supabase] Sukses memuat ${merged.length} GTK (dengan penggabungan data lokal).`);
           }
         } catch {}
 
@@ -423,10 +506,11 @@ export default function App() {
             if (gtkRes.ok) {
               const gtkResult = await gtkRes.json();
               if (gtkResult && gtkResult.status === 'success' && Array.isArray(gtkResult.data) && gtkResult.data.length > 0) {
-                setGtkList(gtkResult.data);
-                freshGTKList = gtkResult.data;
+                const merged = smartMergeGTKWithLocal(gtkResult.data);
+                setGtkList(merged);
+                freshGTKList = merged;
                 loadedGTKFromExpress = true;
-                safeSetItem('dapodik_cached_gtk', gtkResult.data);
+                safeSetItem('dapodik_cached_gtk', merged);
               }
             }
           } catch {}
@@ -434,8 +518,10 @@ export default function App() {
           if (!loadedGTKFromExpress) {
             const directGTK = await fetchGTKDirectly(appConfig);
             if (directGTK && directGTK.length > 0) {
-              setGtkList(directGTK);
-              freshGTKList = directGTK;
+              const merged = smartMergeGTKWithLocal(directGTK);
+              setGtkList(merged);
+              freshGTKList = merged;
+              safeSetItem('dapodik_cached_gtk', merged);
             }
           }
         }
@@ -699,9 +785,29 @@ export default function App() {
   };
 
   // Handle Impor Data Biodata Siswa Lengkap
-  const handleImportStudents = (newStudents: Student[]) => {
-    setStudents(newStudents);
-    safeSetItem('dapodik_cached_students', newStudents);
+  const handleImportStudents = async (newStudents: Student[]) => {
+    const normalized = newStudents.map(normalizeStudent);
+    setStudents(normalized);
+    safeSetItem('dapodik_cached_students', normalized);
+    safeSetItem('dapodik_students_imported_at', Date.now());
+
+    // 1. Simpan ke Express Server agar tersimpan di file disk (data_students_cache.json)
+    try {
+      await fetch('/api/students/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ students: normalized, mode: 'replace' })
+      });
+    } catch (e) {
+      console.warn('Gagal sinkron import ke Express server:', e);
+    }
+
+    // 2. Sinkronkan ke Supabase secara batch
+    try {
+      await batchUpsertStudentsSupabase(normalized);
+    } catch (err) {
+      console.warn('[Supabase] Gagal batch upsert students setelah import:', err);
+    }
   };
 
   // Handle Update Keterangan PIP & Desil Siswa

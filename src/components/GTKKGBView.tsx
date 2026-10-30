@@ -162,11 +162,9 @@ export const GTKKGBView: React.FC<GTKKGBViewProps> = ({
       timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
     });
 
-    if (appConfig.webAppUrl) {
-      syncAllKGBDirectly(appConfig.webAppUrl, finalList, mode).catch((err) => {
-        console.warn('Sync KGB background error:', err);
-      });
-    }
+    syncAllKGBDirectly(appConfig?.webAppUrl || '', finalList, mode).catch((err) => {
+      console.warn('Sync KGB background error:', err);
+    });
   };
 
   // Save to safe storage

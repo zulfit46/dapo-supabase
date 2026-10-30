@@ -446,3 +446,83 @@ export type ActiveTab =
 
 export type AppTheme = 'aurora-glass' | 'classic';
 
+// Legacy / Supplementary Records for POS, FileHub, and MockData
+export interface StudentRecord {
+  id: string;
+  nisn: string;
+  nama: string;
+  kelas: string;
+  jurusan: string;
+  jenisKelamin: 'L' | 'P' | string;
+  status: string;
+}
+
+export interface TeacherRecord {
+  id: string;
+  nip: string;
+  nama: string;
+  mapel: string;
+  statusKepegawaian: string;
+  kehadiranPersen: number;
+}
+
+export interface PosProduct {
+  id: string;
+  kode: string;
+  nama: string;
+  kategori: string;
+  harga: number;
+  stok: number;
+  satuan: string;
+}
+
+export interface PosCartItem extends PosProduct {
+  quantity: number;
+  subtotal?: number;
+}
+
+export interface UploadedFileItem {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  category: string;
+  lastModified: number;
+  content?: string;
+  url?: string;
+  lineCount?: number;
+  status?: 'active' | 'archived' | 'processing' | string;
+}
+
+// Desil Data & Options
+export interface DesilData {
+  rowIndex?: number;
+  nisn: string;
+  nama?: string;
+  rombel?: string;
+  desil?: string;
+  ket_pip?: string;
+  ketPip?: string;
+  [key: string]: any;
+}
+
+export const DESIL_OPTIONS = [
+  'Desil 1',
+  'Desil 2',
+  'Desil 3',
+  'Desil 4',
+  'Desil 5',
+  'Desil 6',
+  'Desil 7',
+  'Desil 8',
+  'Desil 9',
+  'Desil 10'
+];
+
+export const KET_PIP_OPTIONS = [
+  'Diusulkan',
+  'Tidak Diusulkan',
+  'Penerima PIP',
+  'Belum Ditentukan'
+];
+
